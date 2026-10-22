@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<!--
+  InterMask 3D skeleton viewer.
+
+  Loads a JSON file written by ../export_motion_json.py (schema: caption,
+  fps, jointNames, edges, frames, personA, personB -- each person an array
+  of [frames][22][3] xyz positions) and renders both people as a 3D
+  skeleton you can freely orbit/zoom/pan around, with play/pause and a
+  frame scrubber. This is the upgrade over the paper's own flat,
+  fixed-camera stick-figure .mp4.
+
+  Run:
+    cd viewer
+    python3 -m http.server 8000
+    open http://localhost:8000/index.html?file=motions/sample.json
+
+  (Must be served over http:// -- browsers block fetch() of local JSON
+  over file:// -- a plain "python3 -m http.server" is enough, no build
+  step, no npm install.)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>InterMask — 3D Motion Viewer</title>
+<link rel="icon" href="data:," />
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #11161dcc;
+    --border: #273040;
+    --text: #e7edf5;
+    --muted: #8b98ab;
+    --accentA: #ff8a3d;
+    --accentB: #3da9ff;
+  }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  #canvas-wrap { position: fixed; inset: 0; }
+  canvas { display: block; }
+
+  .hud { position: fixed; z-index: 10; color: var(--text); }
+  #title-bar {
+    top: 16px; left: 16px; right: 16px;
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  }
+  #title-bar h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
+  #title-bar .caption { color: var(--muted); font-size: 13px; }
+
+  #legend { position: fixed; top: 16px; right: 16px; z-index: 10; display: flex; gap: 14px; font-size: 12px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; backdrop-filter: blur(6px); }
+  #legend span.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+
+  #bottom-bar {
+    left: 16px; right: 16px; bottom: 16px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 14px; backdrop-filter: blur(6px);
+    display: flex; align-items: center; gap: 12px;
+  }
+  #bottom-bar button {
+    background: #1b2330; color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; width: 36px; height: 32px; cursor: pointer; font-size: 14px;
+  }
+  #bottom-bar button:hover { background: #242e3e; }
+  #scrub { flex: 1; accent-color: var(--accentB); }
+  #frame-label { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--muted); min-width: 90px; text-align: right; }
+  select {
+    background: #1b2330; color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 8px; font-size: 12px;
+  }
+  #hint { position: fixed; bottom: 70px; left: 50%; transform: translateX(-50%); color: var(--muted); font-size: 11px; z-index: 10; opacity: 0.8; }
+  #error-banner {
+    display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    z-index: 20; background: #2a1414; border: 1px solid #5a2a2a; color: #ffb4b4;
+    padding: 14px 18px; border-radius: 10px; max-width: 560px; font-size: 13px; line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+
+<div id="canvas-wrap"></div>
+
+<div class="hud" id="title-bar">
+  <h1>InterMask · 3D Viewer</h1>
+  <span class="caption" id="caption-text">Loading…</span>
+</div>
+
+<div id="legend">
+  <span><span class="dot" style="background: var(--accentA);"></span>Person A</span>
+  <span><span class="dot" style="background: var(--accentB);"></span>Person B</span>
+</div>
+
+<div class="hud" id="bottom-bar">
+  <button id="btn-play" title="Play / Pause">&#9654;</button>
+  <input id="scrub" type="range" min="0" max="0" value="0" step="1" />
+  <span id="frame-label">0 / 0</span>
+  <select id="speed">
+    <option value="0.25">0.25x</option>
+    <option value="0.5">0.5x</option>
+    <option value="1" selected>1x</option>
+    <option value="1.5">1.5x</option>
+    <option value="2">2x</option>
+  </select>
+</div>
+
+<div id="hint">Drag to orbit · scroll to zoom · right-drag to pan</div>
+<div id="error-banner"></div>
+
+<!--
+  three.js is vendored locally in vendor/three/ (not loaded from a CDN) so
+  this viewer works fully offline -- no internet connection needed during
+  an actual presentation/demo. See vendor/three/VERSION.
+-->
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/build/three.module.min.js",
+    "three/addons/": "./vendor/three/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+function showError(msg) {
+  const el = document.getElementById("error-banner");
+  el.textContent = msg;
+  el.style.display = "block";
+}
+
+function qsParam(name, fallback) {
+  const v = new URLSearchParams(window.location.search).get(name);
+  return v === null ? fallback : v;
+}
+
+// ---------- scene setup ----------
+const wrap = document.getElementById("canvas-wrap");
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0f14);
+scene.fog = new THREE.Fog(0x0b0f14, 6, 16);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.05, 100);
+camera.position.set(2.6, 1.8, 2.6);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+wrap.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.9, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x1a1a1a, 1.1));
+const key = new THREE.DirectionalLight(0xffffff, 0.9);
+key.position.set(3, 5, 2);
+scene.add(key);
+
+const grid = new THREE.GridHelper(10, 20, 0x2a3442, 0x1a212c);
+scene.add(grid);
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---------- skeleton builder ----------
+function buildSkeleton(color) {
+  const group = new THREE.Group();
+  const jointGeo = new THREE.SphereGeometry(0.028, 12, 12);
+  const jointMat = new THREE.MeshStandardMaterial({ color, roughness: 0.4, metalness: 0.1 });
+  const joints = [];
+  for (let i = 0; i < 22; i++) {
+    const m = new THREE.Mesh(jointGeo, jointMat);
+    group.add(m);
+    joints.push(m);
+  }
+  // Head gets a slightly bigger sphere so orientation reads at a glance.
+  joints[15].scale.setScalar(1.6);
+
+  const boneMat = new THREE.LineBasicMaterial({ color, linewidth: 2 });
+  const bones = []; // { line, a, b }
+  return { group, joints, boneMat, bones };
+}
+
+function rebuildBones(skel, edges) {
+  // Remove old bone lines (used if edges ever change at runtime; harmless otherwise).
+  for (const b of skel.bones) skel.group.remove(b.line);
+  skel.bones = [];
+  for (const [a, b] of edges) {
+    const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+    const line = new THREE.Line(geo, skel.boneMat);
+    skel.group.add(line);
+    skel.bones.push({ line, a, b });
+  }
+}
+
+function updateSkeleton(skel, framePositions, heightOffset) {
+  for (let i = 0; i < 22; i++) {
+    const [x, y, z] = framePositions[i];
+    skel.joints[i].position.set(x, y - heightOffset, z);
+  }
+  for (const bone of skel.bones) {
+    const pa = skel.joints[bone.a].position;
+    const pb = skel.joints[bone.b].position;
+    const pos = bone.line.geometry.attributes.position;
+    pos.setXYZ(0, pa.x, pa.y, pa.z);
+    pos.setXYZ(1, pb.x, pb.y, pb.z);
+    pos.needsUpdate = true;
+  }
+}
+
+const skelA = buildSkeleton(0xff8a3d);
+const skelB = buildSkeleton(0x3da9ff);
+scene.add(skelA.group);
+scene.add(skelB.group);
+
+// ---------- playback state ----------
+let motion = null;
+let frame = 0;
+let playing = true;
+let speed = 1;
+let acc = 0;
+
+const scrub = document.getElementById("scrub");
+const frameLabel = document.getElementById("frame-label");
+const btnPlay = document.getElementById("btn-play");
+const speedSel = document.getElementById("speed");
+const captionText = document.getElementById("caption-text");
+
+btnPlay.addEventListener("click", () => {
+  playing = !playing;
+  btnPlay.innerHTML = playing ? "&#9654;" : "&#10073;&#10073;";
+});
+speedSel.addEventListener("change", (e) => { speed = parseFloat(e.target.value); });
+scrub.addEventListener("input", (e) => {
+  frame = parseInt(e.target.value, 10);
+  playing = false;
+  btnPlay.innerHTML = "&#9654;";
+  renderFrame();
+});
+
+function heightOffsetFor(frames) {
+  // Match the original renderer: floor-lock each character by its own
+  // minimum Y across the whole clip, so neither figure floats or sinks.
+  let minY = Infinity;
+  for (const f of frames) for (const [, y] of f) if (y < minY) minY = y;
+  return minY;
+}
+
+function renderFrame() {
+  if (!motion) return;
+  const fA = motion.personA[frame];
+  const fB = motion.personB[frame];
+  updateSkeleton(skelA, fA, motion._offsetA);
+  updateSkeleton(skelB, fB, motion._offsetB);
+  scrub.value = frame;
+  frameLabel.textContent = `${frame + 1} / ${motion.frames}`;
+}
+
+async function loadMotion(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+  const data = await res.json();
+  if (!data.personA || !data.personB || !data.edges) {
+    throw new Error("JSON is missing personA / personB / edges -- was this file written by export_motion_json.py?");
+  }
+  data._offsetA = heightOffsetFor(data.personA);
+  data._offsetB = heightOffsetFor(data.personB);
+  rebuildBones(skelA, data.edges);
+  rebuildBones(skelB, data.edges);
+  motion = data;
+  frame = 0;
+  scrub.max = data.frames - 1;
+  captionText.textContent = data.caption ? `"${data.caption}"` : "(no caption in file)";
+  renderFrame();
+}
+
+const file = qsParam("file", "motions/sample.json");
+loadMotion(file).catch((err) => {
+  console.error(err);
+  showError(
+    `Couldn't load "${file}". ${err.message}\n\n` +
+    `Make sure you're running this through a local server (not double-clicking the file), ` +
+    `and that the path after ?file= exists relative to viewer/index.html.`
+  );
+});
+
+// ---------- animation loop ----------
+let last = performance.now();
+function tick(now) {
+  const dt = (now - last) / 1000;
+  last = now;
+  if (motion && playing) {
+    acc += dt * motion.fps * speed;
+    while (acc >= 1) {
+      frame = (frame + 1) % motion.frames;
+      acc -= 1;
+    }
+    renderFrame();
+  }
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
