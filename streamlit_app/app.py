@@ -140,7 +140,29 @@ def generate_clip(prompt: str, engine) -> dict:
     # plain caption is used instead -- swap back to st.toast() if you ever
     # move off Python 3.7.
     st.caption(f"✓ Generated in {gm.gen_seconds:.1f}s (CPU)")
+    # Stash the real, just-measured stats so the top-of-page stat chips (see
+    # main()) reflect this server's actual loaded model and actual timing --
+    # not the paper's numbers, which were GPU-measured and would be
+    # misleading to show next to a CPU demo.
+    st.session_state["model_param_str"] = engine.param_count_str
+    st.session_state["last_gen_seconds"] = gm.gen_seconds
     return ie.motion_to_viewer_json(gm)
+
+
+def stat_chips():
+    """Params / last-generation-time / device chips, in the spirit of the
+    project deck's 'Params 74M / GPU inference 0.77s' badges -- but reporting
+    this server's own real numbers (CPU, whatever the loaded checkpoint
+    actually contains) rather than the paper's GPU figures, so the demo never
+    shows a number it didn't itself measure."""
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Model size", st.session_state.get("model_param_str", "— (generate once)"))
+    with c2:
+        last = st.session_state.get("last_gen_seconds")
+        st.metric("Last generation", f"{last:.2f}s" if last is not None else "—")
+    with c3:
+        st.metric("Device", "CPU")
 
 
 def main():
@@ -154,6 +176,8 @@ def main():
     available, msg = engine_available()
     if not available:
         st.warning(msg)
+
+    stat_chips()
 
     tab_single, tab_compare, tab_about = st.tabs(["Generate", "Side-by-side compare", "About this demo"])
 

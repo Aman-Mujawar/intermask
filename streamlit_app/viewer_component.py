@@ -158,31 +158,58 @@ window.addEventListener("resize", () => {{
   renderer.setSize(window.innerWidth, window.innerHeight);
 }});
 
+// "Solid mannequin" rendering: instead of a point-and-line stick figure, each
+// bone is a cylinder sized per body part (thicker through the torso/hips,
+// thinner through forearms/hands) and each joint is a sphere, together
+// reading as a filled-in body rather than a wireframe skeleton -- closer to
+// the SMPL-mesh look in the project deck, without needing SMPL's licensed
+// model files. A cylinder is cheap to re-orient and re-length every frame:
+// its default geometry runs along local Y with height 1, so each frame we
+// just set scale.y to the live bone length and quaternion-align local Y to
+// the joint-to-joint direction; radius (X/Z) is never touched, so the limb
+// never looks stretched or pinched.
+const THICK_HINTS = ["pelvis", "spine", "hip", "collar", "neck"];
+const THIN_HINTS = ["wrist", "ankle", "foot", "hand"];
+
+function boneRadiusFor(nameA, nameB) {{
+  const names = [nameA || "", nameB || ""];
+  if (names.some((n) => THICK_HINTS.some((h) => n.includes(h)))) return 0.052;
+  if (names.some((n) => THIN_HINTS.some((h) => n.includes(h)))) return 0.024;
+  return 0.036;
+}}
+
 function buildSkeleton(color) {{
   const group = new THREE.Group();
-  const jointGeo = new THREE.SphereGeometry(0.028, 12, 12);
-  const jointMat = new THREE.MeshStandardMaterial({{ color, roughness: 0.4, metalness: 0.1 }});
+  const jointGeo = new THREE.SphereGeometry(0.038, 14, 14);
+  const bodyMat = new THREE.MeshStandardMaterial({{ color, roughness: 0.55, metalness: 0.05 }});
   const joints = [];
   for (let i = 0; i < 22; i++) {{
-    const m = new THREE.Mesh(jointGeo, jointMat);
+    const m = new THREE.Mesh(jointGeo, bodyMat);
     group.add(m);
     joints.push(m);
   }}
-  joints[15].scale.setScalar(1.6);
-  const boneMat = new THREE.LineBasicMaterial({{ color, linewidth: 2 }});
-  return {{ group, joints, boneMat, bones: [] }};
+  joints[15].scale.setScalar(1.7); // head, exaggerated slightly so it still reads at a glance
+  return {{ group, joints, bodyMat, bones: [] }};
 }}
 
-function rebuildBones(skel, edges) {{
-  for (const b of skel.bones) skel.group.remove(b.line);
+function rebuildBones(skel, edges, jointNames) {{
+  for (const b of skel.bones) skel.group.remove(b.mesh);
   skel.bones = [];
+  const cylGeo = new THREE.CylinderGeometry(1, 1, 1, 10, 1, false);
   for (const [a, b] of edges) {{
-    const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
-    const line = new THREE.Line(geo, skel.boneMat);
-    skel.group.add(line);
-    skel.bones.push({{ line, a, b }});
+    const radius = boneRadiusFor((jointNames || [])[a], (jointNames || [])[b]);
+    const mesh = new THREE.Mesh(cylGeo, skel.bodyMat);
+    mesh.scale.x = radius;
+    mesh.scale.z = radius;
+    skel.group.add(mesh);
+    skel.bones.push({{ mesh, a, b, radius }});
   }}
 }}
+
+const _UP = new THREE.Vector3(0, 1, 0);
+const _dir = new THREE.Vector3();
+const _mid = new THREE.Vector3();
+const _quat = new THREE.Quaternion();
 
 function updateSkeleton(skel, framePositions, heightOffset) {{
   for (let i = 0; i < 22; i++) {{
@@ -192,10 +219,13 @@ function updateSkeleton(skel, framePositions, heightOffset) {{
   for (const bone of skel.bones) {{
     const pa = skel.joints[bone.a].position;
     const pb = skel.joints[bone.b].position;
-    const pos = bone.line.geometry.attributes.position;
-    pos.setXYZ(0, pa.x, pa.y, pa.z);
-    pos.setXYZ(1, pb.x, pb.y, pb.z);
-    pos.needsUpdate = true;
+    _dir.subVectors(pb, pa);
+    const len = Math.max(_dir.length(), 1e-4);
+    _mid.addVectors(pa, pb).multiplyScalar(0.5);
+    _quat.setFromUnitVectors(_UP, _dir.normalize());
+    bone.mesh.position.copy(_mid);
+    bone.mesh.quaternion.copy(_quat);
+    bone.mesh.scale.set(bone.radius, len, bone.radius);
   }}
 }}
 
@@ -248,8 +278,8 @@ function loadMotion(data) {{
   }}
   data._offsetA = heightOffsetFor(data.personA);
   data._offsetB = heightOffsetFor(data.personB);
-  rebuildBones(skelA, data.edges);
-  rebuildBones(skelB, data.edges);
+  rebuildBones(skelA, data.edges, data.jointNames);
+  rebuildBones(skelB, data.edges, data.jointNames);
   motion = data;
   frame = 0;
   scrub.max = data.frames - 1;

@@ -143,6 +143,15 @@ class InterMaskEngine:
         self.trans = self.trans.to(self.device).eval()
         self.trans_epoch = trans_ckpt.get("ep", "?")
 
+        # Total trainable-parameter count across both networks, computed once
+        # at load time from the real loaded weights (not hardcoded from the
+        # paper) -- shown in the UI next to generation time, mirroring the
+        # "Params 74M / GPU inference 0.77s" stat chips in the project deck.
+        n_params = sum(p.numel() for p in self.net.parameters()) + \
+            sum(p.numel() for p in self.trans.parameters())
+        self.param_count = n_params
+        self.param_count_str = f"{n_params / 1e6:.0f}M" if n_params >= 1e6 else f"{n_params / 1e3:.0f}K"
+
     @torch.no_grad()
     def generate_preview(self, prompt: str, motion_len: int = 90, time_steps: int = 20,
                           cond_scale: int = 2, topkr: float = 0.9) -> GeneratedMotion:
