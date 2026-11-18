@@ -1,0 +1,12 @@
+# Add this on top of your existing intermask_cpu conda env (which already
+# has torch, clip, etc. from Month 1). Nothing in your existing
+# requirements/environment.yml needs to change.
+#
+# Pinned to 1.23.0 deliberately: your intermask_cpu env is Python 3.7 (same
+# constraint documented in the Month 1/2 decks), and Streamlit 1.24.0+
+# requires Python >=3.8. 1.23.0 is the newest release that still supports
+# 3.7, and has everything this app uses (st.tabs, st.columns, st.divider,
+# st.cache_resource). If you ever move intermask_cpu to Python 3.8+, you can
+# drop this pin and use a newer Streamlit (and switch st.caption() back to
+# st.toast() in app.py's generate_clip()).
+streamlit==1.23.0
